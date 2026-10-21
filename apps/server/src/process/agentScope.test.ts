@@ -16,6 +16,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as ServerConfig from "../config.ts";
@@ -39,6 +41,12 @@ const running: ScopeState = {
 };
 
 const GiB = 1024 ** 3;
+
+const totalMemory = vi.hoisted(() => ({ bytes: 16 * 1024 ** 3 }));
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, totalmem: () => totalMemory.bytes };
+});
 
 describe("agentSliceMemoryLimits", () => {
   it("leaves headroom on auto, sets no cap when off, and throttles below a fixed cap", () => {
@@ -335,5 +343,27 @@ describe("AgentScope service", () => {
         },
       );
     }),
+  );
+
+  it.effect("follows RAM that grows while the server runs on auto", () =>
+    withFakeSystemd(({ scope, calls }) =>
+      Effect.gen(function* () {
+        const memoryLimits = () =>
+          calls.filter(([, verb]) => verb === "set-property").map((args) => args.slice(4));
+        totalMemory.bytes = 8 * GiB;
+        yield* scope.wrap({ command: "agent", args: [], name: "t", threadId: "a" });
+        expect(memoryLimits()).toEqual([[`MemoryHigh=${4 * GiB}`, `MemoryMax=${6 * GiB}`]]);
+
+        yield* TestClock.adjust("1 minute");
+        expect(memoryLimits()).toHaveLength(1);
+
+        totalMemory.bytes = 16 * GiB;
+        yield* TestClock.adjust("1 minute");
+        expect(memoryLimits()).toEqual([
+          [`MemoryHigh=${4 * GiB}`, `MemoryMax=${6 * GiB}`],
+          [`MemoryHigh=${10 * GiB}`, `MemoryMax=${12 * GiB}`],
+        ]);
+      }),
+    ),
   );
 });

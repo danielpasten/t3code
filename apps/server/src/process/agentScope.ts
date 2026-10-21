@@ -15,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
@@ -100,6 +101,7 @@ const STOPPING_POLL_ATTEMPTS = 20;
 const CLEAR_FAILED_INTERVAL = "1 second";
 const CLEAR_FAILED_ATTEMPTS = 120;
 const MAX_TRACKED_THREADS = 500;
+const AUTO_MEMORY_LIMIT_RECHECK_INTERVAL = "1 minute";
 
 export const make = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
@@ -163,19 +165,28 @@ export const make = Effect.gen(function* () {
   // no work, because setup reads the current setting.
   let memoryLimitSystemctl: string | undefined;
   let appliedMemoryLimit: AgentMemoryLimit | undefined;
+  let appliedTotalBytes = 0;
   const memoryLimitLock = yield* Semaphore.make(1);
   // Reads the setting under the lock, so a change that lands while limits are
   // being applied is applied next instead of losing to an older snapshot. A
   // limit counts as applied only once systemd accepts it, so the next settings
-  // change retries one that failed.
+  // change or RAM check retries one that failed.
   const syncMemoryLimits = Effect.gen(function* () {
     const systemctl = memoryLimitSystemctl;
     if (systemctl === undefined) return undefined;
     const { agentMemoryLimit } = yield* serverSettings.getSettings.pipe(
       Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
     );
-    if (agentMemoryLimit === appliedMemoryLimit) return undefined;
-    const limits = agentSliceMemoryLimits(NodeOS.totalmem(), agentMemoryLimit);
+    // RAM can change while the server runs, as on a VM with dynamic memory,
+    // so "auto" follows the current total.
+    const totalBytes = NodeOS.totalmem();
+    if (
+      agentMemoryLimit === appliedMemoryLimit &&
+      (agentMemoryLimit !== "auto" || totalBytes === appliedTotalBytes)
+    ) {
+      return undefined;
+    }
+    const limits = agentSliceMemoryLimits(totalBytes, agentMemoryLimit);
     const limited = yield* run(systemctl, [
       "--user",
       "set-property",
@@ -191,6 +202,7 @@ export const make = Effect.gen(function* () {
       return undefined;
     }
     appliedMemoryLimit = agentMemoryLimit;
+    appliedTotalBytes = totalBytes;
     return limits;
   }).pipe(memoryLimitLock.withPermits(1), Effect.withSpan("agentScope.syncMemoryLimits"));
 
@@ -245,6 +257,13 @@ export const make = Effect.gen(function* () {
       ),
     ),
   ).pipe(Effect.forkIn(layerScope));
+  yield* syncMemoryLimits.pipe(
+    Effect.flatMap((limits) =>
+      limits === undefined ? Effect.void : Effect.logInfo("Agent memory limits updated", limits),
+    ),
+    Effect.repeat(Schedule.spaced(AUTO_MEMORY_LIMIT_RECHECK_INTERVAL)),
+    Effect.forkIn(layerScope),
+  );
 
   const scopeByThread = new Map<string, { unit: string; oomKilled: boolean }>();
 
